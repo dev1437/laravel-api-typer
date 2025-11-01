@@ -1,0 +1,9 @@
+{
+    "name": "dev1437/laravel-api-typer",
+    "autoload": {
+        "psr-4": {
+            "Dev1437\\LaravelApiTyper\\": "src/"
+        }
+    },
+    "require": {}
+}
