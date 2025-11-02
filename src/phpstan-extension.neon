@@ -1,0 +1,8 @@
+services:
+    -
+        class: Dev1437\LaravelApiTyper\ControllerReturnTypeCollector
+        tags:
+            - phpstan.collector
+
+rules:
+    - Dev1437\LaravelApiTyper\CollectControllerReturnTypesRule
