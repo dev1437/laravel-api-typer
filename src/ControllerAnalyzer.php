@@ -1,8 +1,8 @@
 <?php
 
-namespace App\Console\Commands\Support;
+namespace Dev1437\LaravelApiTyper;
 
-use App\Attributes\ApiReturnType;
+use Dev1437\LaravelApiTyper\Attributes\ApiReturnType;
 use Illuminate\Http\Resources\Json\ResourceCollection;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Routing\Route;
@@ -33,32 +33,38 @@ class ControllerAnalyzer
      */
     public function analyzeMethod(string $controllerClass, string $methodName, Route $route): ?ApiReturnType
     {
-        try {
-            $reflectionClass = new ReflectionClass($controllerClass);
+        $reflectionClass = new ReflectionClass($controllerClass);
 
-            if (!$reflectionClass->hasMethod($methodName)) {
-                return null;
-            }
-
-            $method = $reflectionClass->getMethod($methodName);
-
-            // First, check for ApiReturnType attribute
-            $attribute = $this->getApiReturnTypeAttribute($method);
-            if ($attribute) {
-                return $attribute;
-            }
-
-            // If no attribute, try to infer from method signature and name
-            return $this->getApiReturnTypeFromPhpstanType($controllerClass, $methodName);
-
-        } catch (\Exception $e) {
+        if (!$reflectionClass->hasMethod($methodName)) {
             return null;
         }
+
+        $method = $reflectionClass->getMethod($methodName);
+
+        // First, check for ApiReturnType attribute
+        $attribute = $this->getApiReturnTypeAttribute($method);
+        if ($attribute) {
+            return $attribute;
+        }
+
+        // If no attribute, try to infer from method signature and name
+        return $this->getApiReturnTypeFromPhpstanType($controllerClass, $methodName);
     }
 
     private function getApiReturnTypeFromPhpstanType(string $controllerClass, string $methodName): ?ApiReturnType
     {
-        $returnTypeString = $this->returnTypes[$controllerClass][$methodName]['return_type'] ?? null;
+        $methodData = $this->returnTypes[$controllerClass][$methodName] ?? null;
+
+        if (!$methodData) {
+            return null;
+        }
+
+        // If requires_attribute is true, return null to indicate attribute should be added
+        if ($methodData['requires_attribute'] ?? false) {
+            return null;
+        }
+
+        $returnTypeString = $methodData['return_type'] ?? null;
 
         if (!$returnTypeString) {
             return null;
@@ -77,7 +83,10 @@ class ControllerAnalyzer
             $isCollection = true; // Paginators are also collections
 
             // Extract model from generic type like LengthAwarePaginator<App\Models\User>
-            if (preg_match('/<([^>]+)>/', $returnTypeString, $matches)) {
+            // or from Collection<int, App\Models\Car> pattern in paginator
+            if (preg_match('/<[^>]*,\s*([^>]+)>/', $returnTypeString, $matches)) {
+                $model = $this->extractModelFromReturnType($matches[1]);
+            } elseif (preg_match('/<([^>]+)>/', $returnTypeString, $matches)) {
                 $model = $this->extractModelFromReturnType($matches[1]);
             }
         }
@@ -102,47 +111,44 @@ class ControllerAnalyzer
             }
         }
 
-        // Check if it's a regular collection
+        // Check if it's a regular Collection
         if (!$isPaginated && str_contains($returnTypeString, 'Collection') &&
             !str_contains($returnTypeString, 'ResourceCollection')) {
             $isCollection = true;
 
-            // Extract model from generic type like Collection<App\Models\User>
-            if (preg_match('/Collection<([^>]+)>/', $returnTypeString, $matches)) {
+            // Extract model from generic type like Collection<int, App\Models\Car>
+            if (preg_match('/Collection<[^>]*,\s*([^>]+)>/', $returnTypeString, $matches)) {
+                $model = $this->extractModelFromReturnType($matches[1]);
+            } elseif (preg_match('/Collection<([^>]+)>/', $returnTypeString, $matches)) {
                 $model = $this->extractModelFromReturnType($matches[1]);
             }
         }
 
-        // Check if it's an array type
-        if (preg_match('/([^\[\]]+)\[\]/', $returnTypeString, $matches)) {
+        // Check if it's an array type like array{App\Models\Car} or array<int, App\Models\Car>
+        if (preg_match('/^array/', $returnTypeString)) {
             $isCollection = true;
-            $model = $this->extractModelFromReturnType($matches[1]);
+
+            // Extract model from array type like array{App\Models\Car} or array<int, App\Models\Car>
+            if (preg_match('/array\{([^}]+)\}/', $returnTypeString, $matches)) {
+                $model = $this->extractModelFromReturnType($matches[1]);
+            } elseif (preg_match('/array<[^>]*,\s*([^>]+)>/', $returnTypeString, $matches)) {
+                $model = $this->extractModelFromReturnType($matches[1]);
+            }
         }
 
-        // If no model extracted yet, try to infer from controller
-        if (!$model) {
-            $model = $this->inferModelFromController($controllerClass);
-        }
-
-        // If still no model, try to extract from the return type string directly
+        // If no model extracted yet, try to extract from the return type string directly
         if (!$model) {
             // Check if the return type itself is a model class
             // Handle full class names like App\Models\User
             if (preg_match('/App\\\\Models\\\\([^<\[\]>]+)/', $returnTypeString, $matches)) {
                 $model = $this->normalizeModelName($matches[1]);
             } elseif (!str_contains($returnTypeString, '<') &&
-                      !str_contains($returnTypeString, '[]') &&
+                      !str_contains($returnTypeString, '{') &&
                       !str_contains($returnTypeString, 'Collection') &&
                       !str_contains($returnTypeString, 'Paginator')) {
                 // Direct model class name (without namespace in some cases)
                 $model = $this->extractModelFromReturnType($returnTypeString);
             }
-        }
-
-        // Use method name patterns as hints if return type doesn't indicate collection/pagination
-        if (!$isCollection && !$isPaginated) {
-            $isCollection = $this->isCollectionMethod($methodName);
-            $isPaginated = $this->isPaginatedMethod($methodName);
         }
 
         // Validate that the model exists in available models if we have one
@@ -185,124 +191,44 @@ class ControllerAnalyzer
     }
 
     /**
-     * Infer return type from method signature and route information
-     */
-    private function inferReturnType(ReflectionMethod $method, Route $route): ?ApiReturnType
-    {
-        $methodName = $method->getName();
-        $returnType = $method->getReturnType();
-
-        // Analyze method name patterns
-        $isCollection = $this->isCollectionMethod($methodName);
-        $isPaginated = $this->isPaginatedMethod($methodName);
-
-        // Try to infer model from controller class name
-        $model = $this->inferModelFromController($method->getDeclaringClass()->getName());
-
-        // Try to infer from return type hint
-        if ($returnType && !$returnType->isBuiltin()) {
-            $returnTypeName = $returnType->getName();
-
-            // Check if it's a resource collection
-            if (is_subclass_of($returnTypeName, ResourceCollection::class)) {
-                $isCollection = true;
-                $isPaginated = true;
-            }
-
-            // Check if it's a paginator
-            if (is_subclass_of($returnTypeName, LengthAwarePaginator::class)) {
-                $isPaginated = true;
-            }
-
-            // Try to extract model from return type
-            if (!$model) {
-                $model = $this->extractModelFromReturnType($returnTypeName);
-            }
-        }
-
-        // If we still don't have a model, try to infer from route parameters
-        if (!$model) {
-            $model = $this->inferModelFromRoute($route);
-        }
-
-        // Validate that the model exists in available models
-        if ($model && !in_array($model, $this->availableModels)) {
-            // Model not found in available models, skip this route
-            return null;
-        }
-
-        if ($model || $isCollection || $isPaginated) {
-            return new ApiReturnType(
-                model: $model,
-                isCollection: $isCollection,
-                isPaginated: $isPaginated
-            );
-        }
-
-        return null;
-    }
-
-    /**
-     * Check if method name suggests it returns a collection
-     */
-    private function isCollectionMethod(string $methodName): bool
-    {
-        $collectionPatterns = ['index', 'search', 'query', 'list', 'all'];
-
-        return in_array($methodName, $collectionPatterns);
-    }
-
-    /**
-     * Check if method name suggests it returns paginated data
-     */
-    private function isPaginatedMethod(string $methodName): bool
-    {
-        $paginatedPatterns = ['index', 'search', 'query', 'list'];
-
-        return in_array($methodName, $paginatedPatterns);
-    }
-
-    /**
-     * Infer model name from controller class name
-     */
-    private function inferModelFromController(string $controllerClass): ?string
-    {
-        // Extract controller name (e.g., "UserController" -> "User")
-        $controllerName = class_basename($controllerClass);
-
-        if (str_ends_with($controllerName, 'Controller')) {
-            $modelName = substr($controllerName, 0, -10); // Remove "Controller"
-
-            // Handle special cases
-            $modelName = $this->normalizeModelName($modelName);
-
-            return $modelName;
-        }
-
-        return null;
-    }
-
-    /**
      * Extract model from return type
      */
     private function extractModelFromReturnType(string $returnType): ?string
     {
-        // Handle generic types like Collection<User>
-        if (preg_match('/Collection<([^>]+)>/', $returnType, $matches)) {
+        // Handle full class names like App\Models\User
+        if (preg_match('/App\\\\Models\\\\([^<\[\]>]+)/', $returnType, $matches)) {
             return $this->normalizeModelName($matches[1]);
         }
 
-        // Handle array types like User[]
-        if (preg_match('/([^\[\]]+)\[\]/', $returnType, $matches)) {
-            return $this->normalizeModelName($matches[1]);
-        }
-
-        // Direct model class
-        if (class_exists($returnType)) {
+        // Handle simple class names (assumed to be models)
+        if (class_exists($returnType) && str_starts_with($returnType, 'App\\Models\\')) {
             return $this->normalizeModelName(class_basename($returnType));
         }
 
+        // If it's a simple name without namespace, try to normalize it
+        if (!str_contains($returnType, '\\')) {
+            return $this->normalizeModelName($returnType);
+        }
+
         return null;
+    }
+
+    /**
+     * Normalize model name to match available models
+     */
+    private function normalizeModelName(string $modelName): string
+    {
+        // Handle special cases if needed
+        // For now, just return as-is, but this can be extended
+        return $modelName;
+    }
+
+    /**
+     * Check if a model name is valid (exists in available models)
+     */
+    private function isValidModelName(string $modelName): bool
+    {
+        return in_array($modelName, $this->availableModels);
     }
 
     /**
@@ -336,43 +262,5 @@ class ControllerAnalyzer
         }
 
         return null;
-    }
-
-    /**
-     * Normalize model name to match TypeScript interface names
-     */
-    private function normalizeModelName(string $modelName): string
-    {
-        // Handle special cases
-        $normalizations = [
-            'WbsCode' => 'WbsCode',
-            'ProjectSupplier' => 'ProjectSupplier',
-            'PackageTradeItem' => 'PackageTradeItem',
-            'VariationOrder' => 'VariationOrder',
-            'LabourDailyRecord' => 'LabourDailyRecord',
-            'PlantDailyRecord' => 'PlantDailyRecord',
-            'DailyQuantity' => 'DailyQuantity',
-            'DailyQuantityLoads' => 'DailyQuantityLoads',
-            'PlantCategory' => 'PlantCategory',
-            'PlantHirePeriod' => 'PlantHirePeriod',
-            'SurveyedQuantity' => 'SurveyedQuantity',
-            'TradeItemCost' => 'TradeItemCost',
-            'VariationOrderCost' => 'VariationOrderCost',
-            'LumpSumCost' => 'LumpSumCost',
-            'RatesCost' => 'RatesCost',
-            'ReportSection' => 'ReportSection',
-            'ReportSectionConfig' => 'ReportSectionConfig',
-            'PackageClaim' => 'PackageClaim',
-        ];
-
-        return $normalizations[$modelName] ?? $modelName;
-    }
-
-    /**
-     * Check if a model name is valid (exists in available models)
-     */
-    private function isValidModelName(string $modelName): bool
-    {
-        return in_array($modelName, $this->availableModels);
     }
 }

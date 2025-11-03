@@ -7,6 +7,10 @@ use PHPStan\Analyser\Scope;
 use PHPStan\Rules\Rule;
 use PHPStan\Rules\RuleErrorBuilder;
 use PHPStan\Reflection\ParametersAcceptorSelector;
+use PHPStan\Type\ErrorType;
+use PHPStan\Type\MixedType;
+use PHPStan\Type\VoidType;
+use PHPStan\Type\TypeCombinator;
 
 /**
  * @implements Rule<Node\Stmt\ClassMethod>
@@ -44,11 +48,19 @@ class CollectControllerReturnTypesRule implements Rule
         
         // Now the scope has the parameter types available
         $returnTypes = [];
-        $this->findReturnTypes($classMethod->stmts ?? [], $scope, $returnTypes);
+        $hasErrorType = false;
+        $this->findReturnTypes($classMethod->stmts ?? [], $scope, $returnTypes, $hasErrorType);
         
+        
+
         $unionType = empty($returnTypes) 
             ? new \PHPStan\Type\VoidType()
             : \PHPStan\Type\TypeCombinator::union(...$returnTypes);
+
+        // Check if the union type contains ErrorType or is ErrorType itself
+        if (!$hasErrorType) {
+            $hasErrorType = ($unionType instanceof ErrorType) || $this->typeContainsErrorType($unionType);
+        }
 
         $data = json_decode(file_get_contents($this->outputFile), true) ?: [];
 
@@ -57,6 +69,7 @@ class CollectControllerReturnTypesRule implements Rule
             'line' => $node->getStartLine(),
             'return_type' => $unionType->describe(\PHPStan\Type\VerbosityLevel::precise()),
             'return_type_object' => $unionType,
+            'requires_attribute' => $hasErrorType,
         ];
 
         file_put_contents($this->outputFile, json_encode($data, JSON_PRETTY_PRINT));
@@ -64,21 +77,56 @@ class CollectControllerReturnTypesRule implements Rule
         return [];
     }
 
-    private function findReturnTypes(array $stmts, Scope $scope, array &$returnTypes): void
+    private function findReturnTypes(array $stmts, Scope $scope, array &$returnTypes, bool &$hasErrorType): void
     {
         foreach ($stmts as $stmt) {
             if ($stmt instanceof Node\Stmt\Return_ && $stmt->expr !== null) {
-                $returnTypes[] = $scope->getType($stmt->expr);
+                $type = $scope->getType($stmt->expr);
+                
+                // Track if ErrorType is encountered
+                if ($type instanceof ErrorType) {
+                    $hasErrorType = true;
+                    $type = new MixedType();
+                }
+                
+                $returnTypes[] = $type;
             }
             
             // Recursively check nested statements
             foreach ($stmt->getSubNodeNames() as $subNodeName) {
                 $subNode = $stmt->$subNodeName;
                 if (is_array($subNode)) {
-                    $this->findReturnTypes($subNode, $scope, $returnTypes);
+                    $this->findReturnTypes($subNode, $scope, $returnTypes, $hasErrorType);
                 }
             }
         }
+    }
+
+    private function typeContainsErrorType(\PHPStan\Type\Type $type): bool
+    {
+        if ($type instanceof ErrorType) {
+            return true;
+        }
+
+        // Check union types
+        if ($type instanceof \PHPStan\Type\UnionType) {
+            foreach ($type->getTypes() as $subType) {
+                if ($this->typeContainsErrorType($subType)) {
+                    return true;
+                }
+            }
+        }
+
+        // Check intersection types
+        if ($type instanceof \PHPStan\Type\IntersectionType) {
+            foreach ($type->getTypes() as $subType) {
+                if ($this->typeContainsErrorType($subType)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     // private function findReturnTypes(Node $node, Scope $scope, array &$returnTypes): void

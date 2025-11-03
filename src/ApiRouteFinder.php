@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Console\Commands\Support;
+namespace Dev1437\LaravelApiTyper;
 
 use Illuminate\Routing\Route;
 use Illuminate\Support\Facades\Route as RouteFacade;
