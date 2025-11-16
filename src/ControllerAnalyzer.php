@@ -65,6 +65,7 @@ class ControllerAnalyzer
         }
 
         $returnTypeString = $methodData['return_type'] ?? null;
+        $resourceInfo = $methodData['returns_resource'] ?? null;
 
         if (!$returnTypeString) {
             return null;
@@ -74,6 +75,38 @@ class ControllerAnalyzer
         $isCollection = false;
         $isPaginated = false;
         $model = null;
+        $resource = null;
+        $with = [];
+
+        // Handle resource returns
+        if ($resourceInfo !== null && is_array($resourceInfo)) {
+            $resource = $resourceInfo['resource_class'] ?? null;
+            $modelType = $resourceInfo['model_type'] ?? null;
+            $with = $resourceInfo['fields'] ?? [];
+
+            // Extract model from model_type
+            if ($modelType) {
+                $model = $this->extractModelFromReturnType($modelType);
+            }
+
+            // Check if resource is a ResourceCollection
+            if ($resource && (str_contains($resource, 'ResourceCollection') ||
+                str_ends_with($resource, 'Collection'))) {
+                $isCollection = true;
+                $isPaginated = true;
+            }
+
+            // If we found a resource, return early with resource info
+            if ($resource) {
+                return new ApiReturnType(
+                    model: $model,
+                    isCollection: $isCollection,
+                    isPaginated: $isPaginated,
+                    resource: class_basename($resource),
+                    with: $with
+                );
+            }
+        }
 
         // Check if it's a paginator type
         if (str_contains($returnTypeString, 'LengthAwarePaginator') ||
@@ -91,7 +124,7 @@ class ControllerAnalyzer
             }
         }
 
-        // Check if it's a resource collection
+        // Check if it's a resource collection (fallback if not caught by resourceInfo)
         if (str_contains($returnTypeString, 'ResourceCollection')) {
             $isCollection = true;
             $isPaginated = true; // Resource collections in Laravel are typically paginated
@@ -158,18 +191,22 @@ class ControllerAnalyzer
                 return new ApiReturnType(
                     model: null, // Don't set model if not in available models
                     isCollection: $isCollection,
-                    isPaginated: $isPaginated
+                    isPaginated: $isPaginated,
+                    resource: $resource ? class_basename($resource) : null,
+                    with: $with
                 );
             }
             return null;
         }
 
         // Return ApiReturnType if we have useful information
-        if ($model || $isCollection || $isPaginated) {
+        if ($model || $isCollection || $isPaginated || $resource) {
             return new ApiReturnType(
                 model: $model,
                 isCollection: $isCollection,
-                isPaginated: $isPaginated
+                isPaginated: $isPaginated,
+                resource: $resource ? class_basename($resource) : null,
+                with: $with
             );
         }
 

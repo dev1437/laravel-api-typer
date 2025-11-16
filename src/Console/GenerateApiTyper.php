@@ -290,8 +290,13 @@ class GenerateApiTyper extends Command
     {
         foreach ($models as $modelName => $model) {
             if ($model) {
-                // Replace model name with field type
-                $returnType = str_replace($modelName, $modelName.'Fields', $returnType);
+                // Replace model name with field type using word boundaries
+                // This ensures we only match complete words
+                $returnType = preg_replace(
+                    '/\b' . preg_quote($modelName, '/') . '\b/',
+                    $modelName . 'Fields',
+                    $returnType
+                );
             }
         }
 

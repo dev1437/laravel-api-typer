@@ -9,6 +9,8 @@ use PHPStan\Type\ErrorType;
 use PHPStan\Type\MixedType;
 use PHPStan\Type\VoidType;
 use PHPStan\Type\TypeCombinator;
+use PHPStan\Type\ObjectType;
+use PHPStan\Reflection\ClassReflection;
 
 /**
  * @implements Rule<\PHPStan\Node\MethodReturnStatementsNode>
@@ -52,16 +54,14 @@ class CollectControllerReturnTypesRule implements Rule
         $methodName = $methodReflection->getName();
 
         // Collect return types from the return statements
-        // MethodReturnStatementsNode provides return statements with their proper scopes!
         $returnTypes = [];
         $hasErrorType = false;
+        $resourceInfo = null;
 
         foreach ($node->getReturnStatements() as $returnStatement) {
             $returnNode = $returnStatement->getReturnNode();
 
             if ($returnNode->expr !== null) {
-                // Use the scope from the return statement - this is the key!
-                // This scope has all variable assignments up to this point
                 $statementScope = $returnStatement->getScope();
                 $type = $statementScope->getType($returnNode->expr);
 
@@ -72,6 +72,11 @@ class CollectControllerReturnTypesRule implements Rule
                 }
 
                 $returnTypes[] = $type;
+
+                // Check if this return is a JsonResource
+                if ($resourceInfo === null) {
+                    $resourceInfo = $this->analyzeResourceReturn($returnNode->expr, $statementScope);
+                }
             }
         }
 
@@ -92,11 +97,220 @@ class CollectControllerReturnTypesRule implements Rule
             'return_type' => $unionType->describe(\PHPStan\Type\VerbosityLevel::precise()),
             'return_type_object' => $unionType,
             'requires_attribute' => $hasErrorType,
+            'returns_resource' => $resourceInfo,
         ];
 
         file_put_contents($this->outputFile, json_encode($data, JSON_PRETTY_PRINT));
 
         return [];
+    }
+
+    /**
+     * Analyze if a return expression is a JsonResource and extract field information
+     */
+    private function analyzeResourceReturn(Node\Expr $expr, Scope $scope): ?array
+    {
+        // Check if it's a new resource instantiation: new SomeResource($model)
+        if ($expr instanceof Node\Expr\New_ && $expr->class instanceof Node\Name) {
+            $className = $expr->class->toString();
+
+            // Resolve the full class name
+            if (!class_exists($className)) {
+                $resolvedName = $scope->resolveName($expr->class);
+                $className = $resolvedName;
+            }
+
+            if (!class_exists($className)) {
+                return null;
+            }
+
+            $reflection = new \ReflectionClass($className);
+
+            // Check if it's a JsonResource
+            if (!$reflection->isSubclassOf('Illuminate\Http\Resources\Json\JsonResource')) {
+                return null;
+            }
+
+            // Get the model type passed to the resource
+            $modelType = null;
+            if (!empty($expr->args)) {
+                $firstArg = $expr->args[0]->value;
+                $argType = $scope->getType($firstArg);
+                $modelType = $argType->describe(\PHPStan\Type\VerbosityLevel::precise());
+            }
+
+            // Extract fields from the resource's toArray method
+            $fields = $this->extractResourceFields($className);
+
+            return [
+                'resource_class' => $className,
+                'model_type' => $modelType,
+                'fields' => $fields,
+            ];
+        }
+
+        // Check if it's a variable that holds a resource
+        $type = $scope->getType($expr);
+        if ($type instanceof ObjectType) {
+            $classReflection = $type->getClassReflection();
+            if ($classReflection && $classReflection->isSubclassOf('Illuminate\Http\Resources\Json\JsonResource')) {
+                $fields = $this->extractResourceFields($classReflection->getName());
+
+                return [
+                    'resource_class' => $classReflection->getName(),
+                    'model_type' => null, // Can't determine from variable
+                    'fields' => $fields,
+                ];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Extract field names from a JsonResource's toArray method
+     */
+    private function extractResourceFields(string $className): array
+    {
+        try {
+            $reflection = new \ReflectionClass($className);
+
+            // Get the toArray method
+            if (!$reflection->hasMethod('toArray')) {
+                return [];
+            }
+
+            $method = $reflection->getMethod('toArray');
+            $fileName = $method->getFileName();
+
+            if (!$fileName || !file_exists($fileName)) {
+                return [];
+            }
+
+            // Parse the file to extract array keys from toArray method
+            $parserFactory = new \PhpParser\ParserFactory();
+            $parser = $parserFactory->createForNewestSupportedVersion();
+
+            $code = file_get_contents($fileName);
+            $ast = $parser->parse($code);
+
+            if (!$ast) {
+                return [];
+            }
+
+            // Find the toArray method in the AST
+            $fields = [];
+            $this->findToArrayMethod($ast, $fields);
+
+            return array_values(array_unique($fields));
+
+        } catch (\Exception $e) {
+            return [];
+        }
+    }
+
+    /**
+     * Recursively find the toArray method and extract array keys
+     */
+    private function findToArrayMethod(array $nodes, array &$fields): void
+    {
+        foreach ($nodes as $node) {
+            if ($node instanceof Node\Stmt\ClassMethod && $node->name->toString() === 'toArray') {
+                // Found the toArray method, extract array keys
+                $this->extractArrayKeys($node->stmts ?? [], $fields);
+                return;
+            }
+
+            // Recursively search in child nodes
+            if ($node instanceof Node) {
+                foreach ($node->getSubNodeNames() as $subNodeName) {
+                    $subNode = $node->$subNodeName;
+                    if (is_array($subNode)) {
+                        $this->findToArrayMethod($subNode, $fields);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract array keys from return statements in toArray method
+     */
+    private function extractArrayKeys(array $stmts, array &$fields): void
+    {
+        foreach ($stmts as $stmt) {
+            // Look for return statements
+            if ($stmt instanceof Node\Stmt\Return_ && $stmt->expr !== null) {
+                $this->extractKeysFromExpr($stmt->expr, $fields);
+            }
+
+            // Recursively check nested statements
+            if ($stmt instanceof Node) {
+                foreach ($stmt->getSubNodeNames() as $subNodeName) {
+                    $subNode = $stmt->$subNodeName;
+                    if (is_array($subNode)) {
+                        $this->extractArrayKeys($subNode, $fields);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract keys from array expressions
+     */
+    private function extractKeysFromExpr(Node\Expr $expr, array &$fields): void
+    {
+        // Handle array expressions
+        if ($expr instanceof Node\Expr\Array_) {
+            foreach ($expr->items as $item) {
+                if ($item === null) {
+                    continue;
+                }
+
+                // Get the key
+                if ($item->key !== null) {
+                    $key = $this->getStringFromNode($item->key);
+                    if ($key !== null) {
+                        $fields[] = $key;
+                    }
+                }
+
+                // Handle spread operator: ...$this->attributesToArray()
+                // if ($item->unpack) {
+                //     // We can't determine keys from spread, but we could note it
+                //     $fields[] = '...(spread)';
+                // }
+            }
+        }
+
+        // Handle array merge/spread in expressions
+        if ($expr instanceof Node\Expr\FuncCall) {
+            // Could be array_merge, etc.
+            foreach ($expr->args as $arg) {
+                $this->extractKeysFromExpr($arg->value, $fields);
+            }
+        }
+    }
+
+    /**
+     * Try to get a string value from a node (for array keys)
+     */
+    private function getStringFromNode(Node\Expr $node): ?string
+    {
+        if ($node instanceof Node\Scalar\String_) {
+            return $node->value;
+        }
+
+        // Handle simple identifiers
+        if ($node instanceof Node\Expr\Variable && is_string($node->name)) {
+            return '$' . $node->name;
+        }
+
+        // Handle property access like 'key' => $this->someProperty
+        // We just want the key, not the value
+
+        return null;
     }
 
     private function typeContainsErrorType(\PHPStan\Type\Type $type): bool
