@@ -84,18 +84,8 @@ class ApiReturnType
         $fields = [];
 
         foreach ($this->with as $field) {
-            // Skip spread operators and other special cases
-            if (str_starts_with($field, '...') || str_starts_with($field, '$')) {
-                // For fields starting with $, normalize the name
-                if (str_starts_with($field, '$')) {
-                    $normalizedField = lcfirst(substr($field, 1));
-                    $fields[] = "  {$normalizedField}: any";
-                }
-                continue;
-            }
-
             // Add regular fields as 'any' type since we don't have type information
-            $fields[] = "  {$field}: any";
+            $fields[] = "  {$field}: unknown";
         }
 
         if (empty($fields)) {
